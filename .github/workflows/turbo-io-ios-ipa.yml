@@ -1,0 +1,180 @@
+# Turbo IO（Turbo1123/Turbo-IO）iOS 未签名 ipa 构建工作流
+#
+# 用法：
+#   1. Fork 仓库 Turbo1123/Turbo-IO（公开仓库 → fork 后 macOS 构建分钟数免费不限量）
+#   2. 在 fork 的 Actions 页面点击启用 workflows
+#   3. 在 fork 里新建文件 .github/workflows/turbo-io-ios-ipa.yml，粘贴本文件内容并提交
+#   4. Actions → Build Turbo IO iOS ipa → Run workflow
+#       - RayNeoCompanionDevice：连眼镜的完整设备版（含厂商 framework）
+#       - RayNeoCompanion：纯源码版（无厂商库，用于先验证整条链路）
+#   5. 构建完成后在运行页底部 Artifacts 下载 turbo-io-ios-unsigned-ipa
+#   6. Windows 端用 Sideloadly + 免费 Apple ID 签名并安装
+#
+# 说明：云端不签名（不需要 Apple 账号/证书），签名在你自己的电脑上用免费 Apple ID 完成。
+#
+# 【关于 ipa 会不会泄露】
+#   - ipa 不会被提交进仓库（它只是 Actions Artifact，不在 Git 文件树里）
+#   - 但公开仓库的 Artifact 任何人都能下载（GitHub 文档：公开资源无需认证即可访问，
+#     且 fork 无法改成私有仓库）。所以默认把保留期设为 1 天，下载后请立刻删除 Artifact 或整个运行记录。
+#   - ipa 里没有任何属于你的东西：未签名 = 没有证书、没有 Apple ID、没有设备 UDID、没有 API Key。
+#     唯一需要注意的是许可问题（PolyForm Noncommercial），别对外分发。
+#   - 两种加固方式（任选）：
+#     1) 在仓库 Settings → Secrets 里加一个 IPA_PASSWORD，本工作流会自动把 ipa 加密成 .7z 再上传，
+#        别人下载了也打不开（Windows 用 7-Zip 解压）。
+#     2) 不用 fork，改为新建【私有仓库】再导入代码（见指南），日志和产物都不会公开；
+#        代价是私库 macOS 分钟数按 10 倍计费，Free 计划约等于每月 200 分钟额度，够跑十几次。
+
+name: Build Turbo IO iOS ipa
+
+on:
+  workflow_dispatch:
+    inputs:
+      scheme:
+        description: '要构建的 scheme'
+        required: true
+        default: 'RayNeoCompanionDevice'
+        type: choice
+        options:
+          - RayNeoCompanionDevice
+          - RayNeoCompanion
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    env:
+      SCHEME: ${{ github.event.inputs.scheme }}
+      PROJECT_DIR: apps/RayNeoCompanion
+      DERIVED: build/DerivedData
+      # 设置了该 Secret 时，产物会自动加密成 .7z；未设置则为普通 ipa
+      IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+
+    steps:
+      - name: 拉取源码
+        uses: actions/checkout@v4
+
+      - name: 选择可用的最新 Xcode
+        run: |
+          set -e
+          echo "镜像内可用 Xcode："
+          ls -d /Applications/Xcode*.app || true
+          LATEST=$(ls -d /Applications/Xcode*.app | sort -V | tail -n1)
+          sudo xcode-select -s "$LATEST"
+          xcode-select -p
+          xcodebuild -version
+          sw_vers
+          node --version
+
+      - name: 安装 XcodeGen
+        run: |
+          set -e
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: 用 XcodeGen 生成工程
+        run: |
+          set -e
+          if [ "$SCHEME" = "RayNeoCompanionDevice" ]; then
+            SPEC="apps/RayNeoCompanion/project-device.yml"
+          else
+            SPEC="apps/RayNeoCompanion/project-source.yml"
+          fi
+          echo "spec: $SPEC"
+          xcodegen generate --spec "$SPEC"
+          ls -d "$PROJECT_DIR"/*.xcodeproj
+
+      - name: 预生成 RayneoNet 声明模块（仅设备版需要）
+        if: ${{ github.event.inputs.scheme == 'RayNeoCompanionDevice' }}
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          OUT=core-probe/RecoveredInterface/build/RayneoNet.swiftmodule
+          mkdir -p "$OUT"
+          xcrun swiftc -emit-module -parse-as-library -module-name RayneoNet \
+            -target arm64-apple-ios16.0 -sdk "$SDK" \
+            core-probe/RecoveredInterface/RayneoNet.swift \
+            -emit-module-path "$OUT/arm64-apple-ios.swiftmodule"
+          ls -l "$OUT"
+
+      - name: 归档构建（关闭代码签名）
+        run: |
+          set -e
+          xcodebuild archive \
+            -project "$PROJECT_DIR/RayNeoCompanion.xcodeproj" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/TurboIO.xcarchive \
+            -derivedDataPath "$DERIVED" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            PROVISIONING_PROFILE="" \
+            DEVELOPMENT_TEAM="" \
+            ENABLE_USER_SCRIPT_SANDBOXING=NO
+
+      - name: 打包成未签名 ipa
+        run: |
+          set -e
+          APP=$(find build/TurboIO.xcarchive/Products/Applications -maxdepth 1 -name '*.app' | head -n1)
+          if [ -z "$APP" ]; then
+            echo "::error::归档产物里找不到 .app"
+            find build/TurboIO.xcarchive -maxdepth 3 || true
+            exit 1
+          fi
+          echo "app bundle: $APP"
+          rm -rf dist && mkdir -p dist/Payload
+          cp -R "$APP" dist/Payload/
+          cd dist
+          zip -qry turbo-io-unsigned.ipa Payload
+          ls -lh turbo-io-unsigned.ipa
+          unzip -l turbo-io-unsigned.ipa | head -20
+
+      - name: （可选）加密产物，防止公开仓库里的 Artifact 被他人使用
+        if: env.IPA_PASSWORD != ''
+        run: |
+          set -e
+          brew install p7zip >/dev/null 2>&1 || true
+          cd dist
+          7z a -t7z -p"$IPA_PASSWORD" -mhe=on turbo-io-unsigned.ipa.7z turbo-io-unsigned.ipa
+          rm -f turbo-io-unsigned.ipa
+          ls -lh
+          echo "已加密：下载后用 7-Zip 输入你设置的密码解压"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: turbo-io-ios-unsigned-ipa
+          path: |
+            dist/turbo-io-unsigned.ipa
+            dist/turbo-io-unsigned.ipa.7z
+          if-no-files-found: error
+          # 最小保留期，降低公开仓库中的暴露窗口；下载后请手动删除
+          retention-days: 1
+
+      - name: 下载后的安装提示
+        if: always()
+        run: |
+          cat <<'EOF'
+          ============================================================
+          产物：turbo-io-unsigned.ipa（未签名，不要双击，Windows 装不上）
+
+          Windows 安装步骤（免费 Apple ID 即可，7 天有效期）：
+            1) 卸载 Microsoft Store 版 iTunes/iCloud，改装 apple.com 官网版
+            2) 手机：设置 > 隐私与安全性 > 开发者模式 → 打开 → 重启
+            3) 数据线连电脑，手机点「信任此电脑」
+            4) 打开 Sideloadly，把 ipa 拖进窗口，填备用 Apple ID，点 Start
+            5) 手机：设置 > 通用 > VPN 与设备管理 → 信任你的 Apple ID
+
+          连接眼镜前必读（官方要求）：
+            先在雷鸟官方 App 内【解绑】眼镜 → 手机蓝牙里对眼镜【忽略此设备】
+            → 长按眼镜按钮约 5 秒直到蓝灯闪烁 → 再在 Turbo IO 里配对
+          ============================================================
+          EOF
